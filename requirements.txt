@@ -1,6 +1,0 @@
-pandas
-numpy
-notebook
-nbformat
-scikit-learn
-matplotlib
