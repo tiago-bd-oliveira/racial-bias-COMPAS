@@ -83,6 +83,46 @@ print(f"Target (RawScore) — mean: {df[TARGET].mean():.2f}, "
 
 
 # =============================================================================
+# SECTION 2.5: CATEGORICAL DATA CLEANING
+# =============================================================================
+# Merge rare categories to reduce sparse OHE columns and improve generalization.
+
+# ── Ethnic_Code_Text cleanup ─────────────────────────────────────────────────
+# Merge "African-Am" (0.08%, typo) → "African-American"
+# Merge rare categories (<4.26%, i.e., below "Other" threshold) → "Other"
+#   Merged: Asian (0.53%), Native American (0.36%), Arabic (0.12%), Oriental (0.06%)
+df["Ethnic_Code_Text"] = df["Ethnic_Code_Text"].replace({
+    "African-Am": "African-American",
+    "Asian": "Other",
+    "Native American": "Other",
+    "Arabic": "Other",
+    "Oriental": "Other",
+})
+
+# ── LegalStatus cleanup ──────────────────────────────────────────────────────
+# Merge rare categories (<7.16%, i.e., below "Other" threshold) → "Other"
+#   Kept: Pretrial (61.76%), Post Sentence (30.13%), Other (7.16%)
+#   Merged: Conditional Release (0.69%), Probation Violator (0.21%),
+#           Parole Violator (0.03%), Deferred Sentencing (0.02%)
+df["LegalStatus"] = df["LegalStatus"].replace({
+    "Conditional Release": "Other",
+    "Probation Violator": "Other",
+    "Parole Violator": "Other",
+    "Deferred Sentencing": "Other",
+})
+
+# ── Drop zero-variance columns ───────────────────────────────────────────────
+# AssessmentReason: all identical values (zero information)
+# Language: 99% English (near-zero variance)
+df = df.drop(columns=["AssessmentReason", "Language"])
+
+print("\nCategorical cleanup:")
+print(f"  Ethnic_Code_Text: merged African-Am → African-American, rare cats → Other")
+print(f"  LegalStatus: merged rare categories → Other")
+print(f"  Dropped: AssessmentReason (zero variance), Language (99% English)")
+
+
+# =============================================================================
 # SECTION 3: FEATURE ENGINEERING
 # =============================================================================
 #
@@ -94,118 +134,86 @@ print(f"Target (RawScore) — mean: {df[TARGET].mean():.2f}, "
 #
 # Each new feature is explained below with its criminological justification.
 
-# ── 3.1  AGE-BASED FEATURES ─────────────────────────────────────────────────
-#
-# Research consistently shows recidivism risk peaks in young adulthood and
-# declines with age (the "age-crime curve"). A single linear age variable
-# cannot fully capture this curve — polynomial and binned representations help.
-
-# (a) Age squared: adds curvature to linear models so they can represent the
-#     peak-then-decline shape without needing a tree-based model.
+# ── 3.1  AGE NONLINEARITY ────────────────────────────────────────────────────
+# Age squared adds curvature so linear models can represent the peak-then-decline
+# shape of the age-crime curve without a tree-based model.
 df["age_sq"] = df["age_at_screening"] ** 2
 
-# (b) Is young adult (<= 25): binary flag. Youth is consistently the strongest
-#     criminological predictor of re-offending. A single feature captures this
-#     threshold effect cleanly for tree-based models.
-df["is_young_adult"] = (df["age_at_screening"] <= 25).astype(int)
+# ── 3.2  HELPER BINARY FLAGS (used in composite calculations, not features) ──
+# These are NOT added to any feature set — their signal is already covered by
+# the OHE of their source columns (CustodyStatus, LegalStatus, Sex, MaritalStatus,
+# Agency_Text). They exist solely as inputs to composite signals in Section 3.9.
+df["is_young_adult"]   = (df["age_at_screening"] <= 25).astype(int)
+df["is_male"]          = (df["Sex_Code_Text"] == "Male").astype(int)
 
-# (c) Age group (ordinal bin): discretises the continuous curve into meaningful
-#     stages. Ordered by typical recidivism risk level from criminology research:
-#       0 = youth (< 22) — highest risk
-#       1 = young adult (22–35)
-#       2 = adult (35–50)  — moderate risk
-#       3 = older adult (> 50) — lowest risk
-df["age_group"] = pd.cut(
-    df["age_at_screening"],
-    bins=[0, 22, 35, 50, 120],
-    labels=[0, 1, 2, 3],
-).astype(int)
-
-
-# ── 3.2  DETENTION STATUS FLAG ───────────────────────────────────────────────
-#
-# Whether a defendant is physically detained (jail/prison) vs. supervised in
-# the community (probation/pretrial release) is a fundamentally different
-# situation. We encode it as a binary feature.
-#   1 → currently behind bars
-#   0 → in the community (on probation, pretrial release, etc.)
 DETAINED_STATUSES = {"Jail Inmate", "Prison Inmate", "Residential Program"}
-df["is_detained"] = df["CustodyStatus"].isin(DETAINED_STATUSES).astype(int)
-
-
-# ── 3.3  PRETRIAL STATUS FLAG ────────────────────────────────────────────────
-#
-# Pretrial defendants have not yet been convicted. Their risk profile is
-# qualitatively different from post-sentence probationers. We flag both
-# the LegalStatus column AND the CustodyStatus column because COMPAS uses
-# both to classify pretrial status.
-df["is_pretrial"] = (
-    (df["LegalStatus"] == "Pretrial")
-    | (df["CustodyStatus"] == "Pretrial Defendant")
+df["is_detained"]      = df["CustodyStatus"].isin(DETAINED_STATUSES).astype(int)
+df["is_on_probation"]  = (
+    (df["CustodyStatus"] == "Probation") | (df["Agency_Text"] == "Probation")
 ).astype(int)
 
-
-# ── 3.4  POST-SENTENCE FLAG ──────────────────────────────────────────────────
-#
-# Post-sentence defendants have been convicted and sentenced. Their scores tend
-# to be used for community supervision decisions (e.g., parole conditions)
-# which differ from pretrial release decisions.
-df["is_post_sentence"] = (df["LegalStatus"] == "Post Sentence").astype(int)
-
-
-# ── 3.5  SOCIAL STABILITY SCORE ──────────────────────────────────────────────
-#
-# Research shows stable social bonds (marriage, long-term partnerships) are
-# protective factors against recidivism. We map marital status to a rough
-# stability score:
-#   1 → indicators of stable partnership  (Married, Significant Other)
-#   0 → no stable partnership / unknown   (Single, Divorced, Separated, Widowed)
-#
-# This collapses 7 categories into a meaningful binary dimension.
 STABLE_STATUSES = {"Married", "Significant Other"}
 df["is_socially_stable"] = df["MaritalStatus"].isin(STABLE_STATUSES).astype(int)
 
-
-# ── 3.6  SEX × AGE INTERACTION ───────────────────────────────────────────────
-#
-# The age-crime relationship is steeper for males than females. An interaction
-# term (product of two features) lets the model learn that being both young
-# AND male carries especially high predicted risk, beyond the sum of each alone.
-# We use the binary sex indicator (1 = Male, 0 = Female) for this.
-df["is_male"] = (df["Sex_Code_Text"] == "Male").astype(int)
+# ── 3.3  SEX × AGE INTERACTION ───────────────────────────────────────────────
+# The age-crime curve is steeper for males. This product lets linear models
+# learn that young + male carries risk beyond the sum of each alone.
+# Interaction term — not redundant with Sex_Code_Text OHE or age_sq alone.
 df["male_x_young"] = df["is_male"] * df["is_young_adult"]
 
-
-# ── 3.7  PROBATION FLAG ──────────────────────────────────────────────────────
-#
-# Being on probation signals a history of prior offending and judicial
-# supervision. It is a distinct risk context from both detention and pretrial.
-df["is_on_probation"] = (
-    (df["CustodyStatus"] == "Probation")
-    | (df["Agency_Text"] == "Probation")
-).astype(int)
-
-
-# ── 3.8  CUSTODY × LEGAL STATUS INTERACTION ──────────────────────────────────
-#
-# No single column captures the full context — e.g., "Jail Inmate + Pretrial"
-# is different from "Jail Inmate + Post Sentence". We create a combined
-# categorical label to capture these combinations as distinct groups.
+# ── 3.4  CUSTODY × LEGAL STATUS INTERACTION ──────────────────────────────────
+# "Jail Inmate + Pretrial" is a different risk context from "Jail Inmate +
+# Post Sentence". A combined categorical captures these distinct combinations
+# that neither source column can express alone.
 df["custody_legal"] = (
     df["CustodyStatus"].fillna("Unknown")
     + "_"
     + df["LegalStatus"].fillna("Unknown")
 )
 
-print("\nFeature engineering complete. New features created:")
-new_features = [
-    "age_sq", "is_young_adult", "age_group",
-    "is_detained", "is_pretrial", "is_post_sentence",
-    "is_socially_stable", "is_male", "male_x_young",
-    "is_on_probation", "custody_legal",
-]
-for f in new_features:
-    print(f"  {f}")
+print("\nFeature engineering complete. Features added to model:")
+print("  age_sq, male_x_young, custody_legal")
+print("  (helper flags computed but not used as standalone features)")
+
+
+# =============================================================================
+# SECTION 3.9: COMPOSITE SIGNALS
+# =============================================================================
+# Composite signals combine multiple features into higher-order representations
+# that neither source column expresses alone. Validated by feature importance
+# audit (iteration 1): binary × binary interactions near-zero when the source
+# categoricals are already OHE'd; continuous × binary interactions survive.
+
+# ── 3.9.1  RISK FACTOR COUNT ─────────────────────────────────────────────────
+# Sum of five binary risk indicators → single "total risk load" for linear
+# models. The individual flags are redundant with OHE categoricals, but their
+# sum creates a new ordinal dimension.
+df["risk_factor_count"] = (
+    df["is_young_adult"]
+    + df["is_male"]
+    + df["is_detained"]
+    + df["is_on_probation"]
+    + (1 - df["is_socially_stable"])
+)
+
+# ── 3.9.2  AGE × SOCIAL STABILITY ────────────────────────────────────────────
+# Protective effect of social bonds varies with age — older married defendants
+# score much lower than older single ones. Continuous × binary product lets
+# linear models represent this slope change.
+df["age_x_stability"] = df["age_at_screening"] * df["is_socially_stable"]
+
+# ── 3.9.3  REPEAT ASSESSMENT ─────────────────────────────────────────────────
+# Person_ID appearing more than once → defendant has returned through the system.
+# Strongest composite signal (importance 0.0824 in iter-1 audit). Acts as a
+# proxy for criminal history depth, which COMPAS uses heavily.
+person_counts = df["Person_ID"].map(df["Person_ID"].value_counts())
+df["repeat_assessment"] = (person_counts > 1).astype(int)
+
+# Dropped after iter-1 audit (importance < 0.005, redundant with OHE):
+#   young_x_detained, young_x_probation, male_x_detained
+
+print("\nComposite signals added to model:")
+print("  risk_factor_count, age_x_stability, repeat_assessment")
 
 
 # =============================================================================
@@ -229,13 +237,22 @@ BASELINE_CAT = [
 ]
 BASELINE_NUM = ["age_at_screening", "IsCompleted"]
 
-# Engineered: baseline + all new features
-ENGINEERED_CAT = BASELINE_CAT + ["custody_legal"]     # new categorical
-ENGINEERED_NUM = BASELINE_NUM + [                      # new numerical/binary
-    "age_sq", "is_young_adult", "age_group",
-    "is_detained", "is_pretrial", "is_post_sentence",
-    "is_socially_stable", "is_male", "male_x_young",
-    "is_on_probation",
+# Engineered: baseline + non-redundant features only.
+# Dropped after iter-1 audit: is_young_adult, age_group, is_detained,
+# is_pretrial, is_post_sentence, is_socially_stable, is_male, is_on_probation
+# — all subsumed by OHE of their source categoricals (CustodyStatus, LegalStatus,
+# Sex_Code_Text, MaritalStatus, Agency_Text).
+ENGINEERED_CAT = BASELINE_CAT + ["custody_legal"]
+ENGINEERED_NUM = BASELINE_NUM + ["age_sq", "male_x_young"]
+
+# Composite: engineered + validated composite signals.
+# Dropped after iter-1 audit: young_x_detained, young_x_probation,
+# male_x_detained — importance < 0.005, no signal beyond OHE source columns.
+COMPOSITE_CAT = ENGINEERED_CAT
+COMPOSITE_NUM = ENGINEERED_NUM + [
+    "risk_factor_count",
+    "age_x_stability",
+    "repeat_assessment",
 ]
 
 
@@ -462,13 +479,13 @@ def per_group_mae(pipeline, X_test, y_test, ethnic_groups):
 # ── Handle categoricals ───────────────────────────────────────────────────────
 # Fill NaN with the string "Unknown" so it becomes its own one-hot category.
 # This is more informative than dropping rows or ignoring missingness.
-all_cat_cols = list(set(ENGINEERED_CAT))
+all_cat_cols = list(set(COMPOSITE_CAT))
 for col in all_cat_cols:
     df[col] = df[col].fillna("Unknown")
 
 # ── Handle numericals ─────────────────────────────────────────────────────────
 # Fill NaN with the median (not mean) — median is robust to outliers.
-all_num_cols = list(set(ENGINEERED_NUM))
+all_num_cols = list(set(COMPOSITE_NUM))
 for col in all_num_cols:
     df[col] = df[col].fillna(df[col].median())
 
@@ -480,12 +497,14 @@ ethnic_series = df["Ethnic_Code_Text"]   # keep aligned for fairness analysis
 
 X_base = df[BASELINE_CAT + BASELINE_NUM]
 X_eng  = df[ENGINEERED_CAT + ENGINEERED_NUM]
+X_comp = df[COMPOSITE_CAT  + COMPOSITE_NUM]
 
 (X_base_train, X_base_test,
  X_eng_train,  X_eng_test,
+ X_comp_train, X_comp_test,
  y_train,      y_test,
  _,            ethnic_test) = train_test_split(
-    X_base, X_eng, y, ethnic_series,
+    X_base, X_eng, X_comp, y, ethnic_series,
     test_size=0.2, random_state=RANDOM_STATE
 )
 
@@ -546,31 +565,41 @@ print("=" * 70)
     "ENGINEERED (baseline + 11 new features)",
 )
 
+(composite_results,
+ composite_fit,
+ composite_pipelines) = run_experiment(
+    X_comp_train, X_comp_test,
+    COMPOSITE_CAT, COMPOSITE_NUM,
+    "COMPOSITE (engineered + 6 interaction signals)",
+)
+
 
 # =============================================================================
-# SECTION 9: BEFORE vs. AFTER COMPARISON TABLE
+# SECTION 9: THREE-WAY COMPARISON TABLE
 # =============================================================================
 
 print("\n\n" + "=" * 70)
-print(" COMPARISON: BASELINE vs. ENGINEERED FEATURES")
+print(" COMPARISON: BASELINE → ENGINEERED → COMPOSITE")
 print("=" * 70)
-print(f"{'Model':<28} {'Δ MAE':>10} {'Δ RMSE':>10} {'Δ R²':>8}")
-print("-" * 60)
+print(f"{'Model':<28} {'B→E Δ MAE':>12} {'E→C Δ MAE':>12} {'B→C Δ R²':>10}")
+print("-" * 66)
 
 for model_name in baseline_results:
     b = baseline_results[model_name]
     e = engineered_results[model_name]
-    delta_mae  = e["MAE"]  - b["MAE"]    # negative = improvement
-    delta_rmse = e["RMSE"] - b["RMSE"]
-    delta_r2   = e["R2"]   - b["R2"]     # positive = improvement
-    arrow_mae  = "↓" if delta_mae  < 0 else "↑"
-    arrow_r2   = "↑" if delta_r2   > 0 else "↓"
+    c = composite_results[model_name]
+    be_mae = e["MAE"] - b["MAE"]
+    ec_mae = c["MAE"] - e["MAE"]
+    bc_r2  = c["R2"]  - b["R2"]
+    arrow_be  = "↓" if be_mae < 0 else "↑"
+    arrow_ec  = "↓" if ec_mae < 0 else "↑"
+    arrow_r2  = "↑" if bc_r2  > 0 else "↓"
     print(f"  {model_name:<26}  "
-          f"{arrow_mae}{abs(delta_mae):.4f}      "
-          f"{arrow_mae}{abs(delta_rmse):.4f}      "
-          f"{arrow_r2}{abs(delta_r2):.4f}")
+          f"{arrow_be}{abs(be_mae):.4f}        "
+          f"{arrow_ec}{abs(ec_mae):.4f}        "
+          f"{arrow_r2}{abs(bc_r2):.4f}")
 
-print("\nNote: ↓ MAE/RMSE = better prediction  |  ↑ R² = better explanation of variance")
+print("\nNote: ↓ MAE = better  |  ↑ R² = better  |  B→E = eng gain  |  E→C = composite gain")
 
 
 # =============================================================================
@@ -595,6 +624,7 @@ print("\nNote: ↓ MAE/RMSE = better prediction  |  ↑ R² = better explanation
 for label, fit_diags in [
     ("BASELINE",   baseline_fit),
     ("ENGINEERED", engineered_fit),
+    ("COMPOSITE",  composite_fit),
 ]:
     print(f"\n{'=' * 70}")
     print(f" OVERFITTING DIAGNOSIS — {label}")
@@ -657,7 +687,7 @@ for label, fit_diags in [
 #     → Normalises the error to be interpretable regardless of scale.
 
 print(f"\n\n{'=' * 70}")
-print(" ERROR DISTRIBUTION — ENGINEERED FEATURE SET (all models)")
+print(" ERROR DISTRIBUTION — COMPOSITE FEATURE SET (all models)")
 print("=" * 70)
 print(" RawScore target range for Risk of Recidivism : "
       f"{y_test.min():.2f}  to  {y_test.max():.2f} "
@@ -665,8 +695,8 @@ print(" RawScore target range for Risk of Recidivism : "
 print(" DecileScore bins are ≈ 0.5–0.8 RawScore units wide")
 print()
 
-for model_name, pipeline in engineered_pipelines.items():
-    ed = error_distribution(pipeline, X_eng_test, y_test)
+for model_name, pipeline in composite_pipelines.items():
+    ed = error_distribution(pipeline, X_comp_test, y_test)
     bias_dir = "over-predicted" if ed["mean_signed_error"] > 0 else "under-predicted"
 
     print(f"  ── {model_name} ──")
@@ -701,13 +731,13 @@ for model_name, pipeline in engineered_pipelines.items():
 # producing unavoidable disparities without any intentional discrimination.
 
 print("\n\n" + "=" * 70)
-print(" FAIRNESS ANALYSIS — Per-Ethnic-Group MAE (Engineered, Random Forest)")
+print(" FAIRNESS ANALYSIS — Per-Ethnic-Group MAE (Composite, Random Forest)")
 print("=" * 70)
 print(" Lower MAE = model predicts that group's scores more accurately")
 print(" Large differences across groups signal potential model bias\n")
 
-best_pipeline = engineered_pipelines["Random Forest (100)"]
-group_errors  = per_group_mae(best_pipeline, X_eng_test, y_test, ethnic_test)
+best_pipeline = composite_pipelines["Random Forest (100)"]
+group_errors  = per_group_mae(best_pipeline, X_comp_test, y_test, ethnic_test)
 
 # Sort by MAE for readability
 group_df = (
@@ -729,11 +759,12 @@ print(f"  → Raw MAE disparity: {disparity:.4f} score points")
 print(f"    This means the model's average error is {disparity:.4f} RawScore")
 print(f"    points larger for {worst_g} defendants than for {best_g}.")
 
-# Show how disparity changed between baseline and engineered
-print("\n── Disparity before vs. after feature engineering ──")
+# Show how disparity changed across all three feature sets
+print("\n── Disparity across feature iterations ──")
 for label, pipelines, X_test_variant in [
     ("Baseline  ", baseline_pipelines,   X_base_test),
     ("Engineered", engineered_pipelines, X_eng_test),
+    ("Composite ", composite_pipelines,  X_comp_test),
 ]:
     ge = per_group_mae(pipelines["Random Forest (100)"],
                        X_test_variant, y_test, ethnic_test)
@@ -743,24 +774,25 @@ for label, pipelines, X_test_variant in [
 
 
 # =============================================================================
-# SECTION 11: FEATURE IMPORTANCE (Engineered Random Forest)
+# SECTION 11: FEATURE IMPORTANCE (Composite Random Forest)
 # =============================================================================
 #
 # Impurity-based feature importance tells us which features the forest used
 # most for its splits. High importance ≠ causal relationship. But it tells us:
 #   - What information drives the model's predictions
 #   - Whether race is being used implicitly (via Ethnic_Code_Text encoding)
-#   - Whether the new engineered features add signal beyond the originals
+#   - Whether composite signals add signal beyond engineered features
+#   - Which composites are dead weight and can be dropped next iteration
 
 print("\n\n" + "=" * 70)
-print(" FEATURE IMPORTANCE — Random Forest (Engineered Features)")
+print(" FEATURE IMPORTANCE — Random Forest (Composite Features)")
 print("=" * 70)
 
-# Retrieve the fitted preprocessor from the pipeline
+# Retrieve the fitted preprocessor from the composite pipeline
 prep_step = best_pipeline.named_steps["prep"]
 ohe       = prep_step.named_transformers_["cat"]
-cat_names = ohe.get_feature_names_out(ENGINEERED_CAT).tolist()
-all_names = cat_names + ENGINEERED_NUM
+cat_names = ohe.get_feature_names_out(COMPOSITE_CAT).tolist()
+all_names = cat_names + COMPOSITE_NUM
 
 importances = best_pipeline.named_steps["model"].feature_importances_
 
@@ -770,26 +802,49 @@ imp_df = (
     .reset_index(drop=True)
 )
 
-# Show top 25 features and group by "origin" (baseline vs. engineered)
-print("\nTop 25 features (sorted by importance):\n")
-print(f"  {'#':<4} {'Feature':<45} {'Importance':>10}  Origin")
-print("  " + "-" * 65)
 engineered_feature_keywords = [
-    "age_sq", "is_young_adult", "age_group", "is_detained",
-    "is_pretrial", "is_post_sentence", "is_socially_stable",
-    "is_male", "male_x_young", "is_on_probation", "custody_legal",
+    "age_sq", "male_x_young", "custody_legal",
 ]
-for i, row in imp_df.head(25).iterrows():
-    origin = "★ engineered" if any(kw in row["Feature"] for kw in engineered_feature_keywords) else "  baseline"
-    print(f"  {i+1:<4} {row['Feature']:<45} {row['Importance']:>10.4f}  {origin}")
+composite_feature_keywords = [
+    "risk_factor_count", "age_x_stability", "repeat_assessment",
+]
 
-# Summarise total importance of engineered vs. baseline features
-eng_total  = imp_df[imp_df["Feature"].apply(
+def feature_origin(name):
+    if any(kw in name for kw in composite_feature_keywords):
+        return "◆ composite"
+    if any(kw in name for kw in engineered_feature_keywords):
+        return "★ engineered"
+    return "  baseline"
+
+# Show top 30 features and group by origin
+print("\nTop 30 features (sorted by importance):\n")
+print(f"  {'#':<4} {'Feature':<45} {'Importance':>10}  Origin")
+print("  " + "-" * 70)
+for i, row in imp_df.head(30).iterrows():
+    print(f"  {i+1:<4} {row['Feature']:<45} {row['Importance']:>10.4f}  {feature_origin(row['Feature'])}")
+
+# Summarise total importance by tier
+comp_total = imp_df[imp_df["Feature"].apply(
+    lambda f: any(kw in f for kw in composite_feature_keywords)
+)]["Importance"].sum()
+eng_total = imp_df[imp_df["Feature"].apply(
     lambda f: any(kw in f for kw in engineered_feature_keywords)
 )]["Importance"].sum()
-base_total = 1.0 - eng_total
-print(f"\n  Total importance captured by engineered features : {eng_total:.4f} ({eng_total*100:.1f}%)")
-print(f"  Total importance captured by baseline features   : {base_total:.4f} ({base_total*100:.1f}%)")
+base_total = 1.0 - comp_total - eng_total
+
+print(f"\n  Total importance — baseline features  : {base_total:.4f} ({base_total*100:.1f}%)")
+print(f"  Total importance — engineered features : {eng_total:.4f}  ({eng_total*100:.1f}%)")
+print(f"  Total importance — composite signals   : {comp_total:.4f}  ({comp_total*100:.1f}%)")
+
+# Per-composite importance — tells us which to keep for iteration 2
+print("\n  Composite signal breakdown (iteration 1 audit):")
+print(f"  {'Signal':<25} {'Importance':>10}  Keep?")
+print("  " + "-" * 45)
+for kw in ["risk_factor_count", "age_x_stability", "repeat_assessment"]:
+    kw_imp = imp_df[imp_df["Feature"] == kw]["Importance"]
+    imp_val = float(kw_imp.iloc[0]) if len(kw_imp) > 0 else 0.0
+    keep = "YES" if imp_val > 0.005 else "drop (< 0.005)"
+    print(f"  {kw:<25} {imp_val:>10.4f}  {keep}")
 
 
 # =============================================================================
