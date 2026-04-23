@@ -6,3 +6,4 @@ seaborn
 numpy
 mord
 dython
+seaborn
